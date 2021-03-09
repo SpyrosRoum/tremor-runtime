@@ -498,7 +498,7 @@ pub(crate) fn exec_unary<'run, 'event: 'run>(
 #[inline]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn resolve<'run, 'event, 'script, Expr>(
-    outer: &'script Expr,
+    outer: &'run Expr,
     opts: ExecOpts,
     env: &'run Env<'run, 'event, 'script>,
     event: &'run Value<'event>,
@@ -532,10 +532,43 @@ where
         Path::Reserved(ReservedPath::Window { .. }) => &env.consts.window,
     };
 
+    resolve_value(
+        outer,
+        opts,
+        env,
+        event,
+        state,
+        meta,
+        local,
+        path,
+        base_value,
+        path.segments(),
+    )
+}
+
+#[inline]
+#[allow(clippy::too_many_lines)]
+pub(crate) fn resolve_value<'run, 'event, 'script, Expr>(
+    outer: &'run Expr,
+    opts: ExecOpts,
+    env: &'run Env<'run, 'event, 'script>,
+    event: &'run Value<'event>,
+    state: &'run Value<'static>,
+    meta: &'run Value<'event>,
+    local: &'run LocalStack<'event>,
+    path: &'run Path,
+    base_value: &'run Value<'event>,
+    segments: &'run [Segment<'script>],
+) -> Result<Cow<'run, Value<'event>>>
+where
+    Expr: BaseExpr,
+    'script: 'event,
+    'event: 'run,
+{
     // Resolve the targeted value by applying all path segments
     let mut subrange: Option<&[Value]> = None;
     let mut current = base_value;
-    for segment in path.segments() {
+    for segment in segments {
         match segment {
             // Next segment is an identifier: lookup the identifier on `current`, if it's an object
             Segment::Id { mid, key, .. } => {

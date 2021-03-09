@@ -351,14 +351,16 @@ where
     ) -> Result<Cow<'run, Value<'event>>> {
         let target = stry!(expr.target.run(opts, env, event, state, meta, local));
 
-        for predicate in &expr.patterns {
-            let p = &predicate.pattern;
-            let g = &predicate.guard;
-            if stry!(test_predicate_expr(
-                self, opts, env, event, state, meta, local, &target, p, g,
-            )) {
-                let e = &predicate.expr;
-                return Self::execute_effectors(opts, env, event, state, meta, local, e);
+        for cg in &expr.patterns {
+            for predicate in &cg.patterns {
+                let p = &predicate.pattern;
+                let g = &predicate.guard;
+                if stry!(test_predicate_expr(
+                    self, opts, env, event, state, meta, local, &target, p, g,
+                )) {
+                    let e = &predicate.expr;
+                    return Self::execute_effectors(opts, env, event, state, meta, local, e);
+                }
             }
         }
         error_no_clause_hit(self, &env.meta)

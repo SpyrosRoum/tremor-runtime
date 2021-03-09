@@ -41,7 +41,7 @@ use raw::reduce2;
 use serde::Serialize;
 use simd_json::StaticNode;
 use std::borrow::Borrow;
-use std::mem;
+use std::{collections::BTreeMap, mem};
 use upable::Upable;
 
 use self::{
@@ -1178,6 +1178,203 @@ pub struct ImutMatch<'script> {
 }
 impl_expr_mid!(ImutMatch);
 
+/// Precondition for a case group
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClausePreCondition<'script> {
+    /// Segments to look up
+    pub segments: Segments<'script>,
+}
+/// A group of case statements
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum ClauseGroup<'script> {
+    /// A simple group consisting of multiple patterns
+    Simple {
+        /// pre-condition for this group
+        precondition: Option<ClausePreCondition<'script>>,
+        /// Clauses in a group
+        patterns: Vec<PredicateClause<'script>>,
+    },
+
+    /// A search tree based group
+    SearchTree {
+        /// pre-condition for this group
+        precondition: Option<ClausePreCondition<'script>>,
+        /// Clauses in a group
+        tree: BTreeMap<Value<'script>, (Vec<Expr<'script>>, Expr<'script>)>,
+    },
+}
+
+impl<'script> Default for ClauseGroup<'script> {
+    fn default() -> Self {
+        Self::Simple {
+            precondition: None,
+            patterns: Vec::new(),
+        }
+    }
+}
+
+impl<'script> ClauseGroup<'script> {
+    pub(crate) fn precondition(&self) -> Option<&ClausePreCondition<'script>> {
+        match self {
+            ClauseGroup::Simple { precondition, .. } => precondition.as_ref(),
+            ClauseGroup::SearchTree { precondition, .. } => precondition.as_ref(),
+        }
+    }
+    fn replace_last_shadow_use(&mut self, replace_idx: usize) {
+        match self {
+            Self::Simple { patterns, .. } => {
+                // FIXME (is this correct) or should we use the last expr?
+                for p in patterns {
+                    if let Some(expr) = p.exprs.pop() {
+                        p.exprs.push(replace_last_shadow_use(replace_idx, expr))
+                    }
+                }
+            }
+            Self::SearchTree { tree, .. } => {
+                // FIXME (is this correct) or should we use the last expr?
+                for p in tree.values_mut() {
+                    if let Some(expr) = p.0.pop() {
+                        p.0.push(replace_last_shadow_use(replace_idx, expr))
+                    }
+                }
+            }
+        }
+    }
+    fn optimize(&mut self) {
+        if let Self::Simple {
+            patterns,
+            precondition,
+        } = self
+        {
+            let mut first_key = None;
+            let count = patterns.len();
+            // return if we have only 1 pattern or less to optimize
+            if count <= 1 {
+                return;
+            };
+            // if all patterns
+
+            if patterns.iter().all(|p| {
+                // are record patterns
+                if let PredicateClause {
+                    pattern: Pattern::Record(RecordPattern { fields, .. }),
+                    ..
+                } = p
+                {
+                    // there are no additional fields looked at
+                    let is_one_element = fields.len() == 1;
+                    is_one_element
+                        && fields
+                            .get(0)
+                            .map(|f| {
+                                // where the record key is a binary equal
+                                if let PredicatePattern::Bin {
+                                    kind: BinOpKind::Eq,
+                                    key,
+                                    ..
+                                } = f
+                                {
+                                    // and the key of this equal is the same in all patterns
+                                    if let Some(first) = &first_key {
+                                        first == key
+                                    } else {
+                                        first_key = Some(key.clone());
+                                        // this is the first item so we can assume so far it's all OK
+                                        true
+                                    }
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or_default()
+                } else {
+                    false
+                }
+            }) {
+                println!("optimize: {}", patterns.len()); // FIXME
+
+                // optimisation for:
+                // match event of
+                //   case %{a == "b"} =>...
+                //   case %{a == "c"} =>...
+                // end;
+                //        TO
+                // match event.a of
+                //   case "b" =>...
+                //   case "c" =>...
+                // end;
+                if let Some(key) = &first_key {
+                    // We want to make sure that our key exists
+                    *precondition = Some(ClausePreCondition {
+                        segments: vec![Segment::Id {
+                            mid: 0,
+                            key: key.clone(),
+                        }],
+                    });
+
+                    // we now have:
+                    // match event.a of ...
+
+                    for pattern in patterns {
+                        let p = if let PredicateClause {
+                            pattern: Pattern::Record(RecordPattern { fields, .. }),
+                            ..
+                        } = pattern
+                        {
+                            if let Some(PredicatePattern::Bin { rhs, .. }) = fields.pop() {
+                                Some(Pattern::Expr(rhs))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(p) = p {
+                            pattern.pattern = p
+                        }
+                    }
+                }
+                self.optimize();
+            } else if patterns.iter().all(|p| {
+                if let PredicateClause {
+                    pattern: Pattern::Expr(ImutExprInt::Literal(_)),
+                    guard: None,
+                    ..
+                } = p
+                {
+                    true
+                } else {
+                    false
+                }
+            }) {
+                println!("tree optimize: {}", patterns.len()); // FIXME
+                                                               // We swap out the precondition and patterns so we can construct a new self
+                let mut precondition1 = None;
+                mem::swap(&mut precondition1, precondition);
+                let mut patterns1 = Vec::new();
+                mem::swap(&mut patterns1, patterns);
+
+                let mut tree = BTreeMap::new();
+                for p in patterns1 {
+                    if let PredicateClause {
+                        pattern: Pattern::Expr(ImutExprInt::Literal(Literal { value, .. })),
+                        exprs,
+                        last_expr,
+                        ..
+                    } = p
+                    {
+                        tree.insert(value, (exprs, last_expr));
+                    }
+                }
+                *self = Self::SearchTree {
+                    precondition: precondition1,
+                    tree: tree,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates a predicate expression form
 pub struct PredicateClause<'script> {
@@ -1192,7 +1389,27 @@ pub struct PredicateClause<'script> {
     /// The last expression
     pub last_expr: Expr<'script>,
 }
+
+impl<'script> PredicateClause<'script> {
+    fn is_exclusive_to(&self, other: &Self) -> bool {
+        // If we have guards we assume they are not exclusive
+        // this saves us analyzing guards
+        if self.guard.is_some() || other.guard.is_some() {
+            false
+        } else {
+            self.pattern.is_exclusive_to(&other.pattern)
+        }
+    }
+}
+
 impl_expr_mid!(PredicateClause);
+
+/// A group of case statements
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ImutClauseGroup<'script> {
+    /// Clauses in a group
+    pub patterns: Vec<ImutPredicateClause<'script>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates an immutable predicate expression form
@@ -1381,6 +1598,33 @@ impl<'script> Pattern<'script> {
     fn is_assign(&self) -> bool {
         matches!(self, Pattern::Assign(_))
     }
+    fn is_exclusive_to(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Two literals that are different are distinct
+            (Pattern::Expr(ImutExprInt::Literal(l1)), Pattern::Expr(ImutExprInt::Literal(l2))) => {
+                l1 != l2
+            }
+            // For record patterns we compare directly
+            (Pattern::Record(r1), Pattern::Record(r2)) => {
+                r1.is_exclusive_to(r2) || r2.is_exclusive_to(r1)
+            }
+            // for assignments we compare internal value
+            (Pattern::Assign(AssignPattern { pattern, .. }), p2) => pattern.is_exclusive_to(p2),
+            (p1, Pattern::Assign(AssignPattern { pattern, .. })) => p1.is_exclusive_to(pattern),
+            // else we're just not accepting equality
+            (Pattern::Array(_), Pattern::Array(_)) => false,
+            (
+                Pattern::Tuple(TuplePattern { exprs: exprs1, .. }),
+                Pattern::Tuple(TuplePattern { exprs: exprs2, .. }),
+            ) => exprs1
+                .iter()
+                .zip(exprs2.iter())
+                .any(|(e1, e2)| e1.is_exclusive_to(e2) || e2.is_exclusive_to(e1)),
+            (Pattern::DoNotCare, Pattern::DoNotCare) => false,
+            (Pattern::Default, Pattern::Default) => false,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1449,6 +1693,23 @@ pub enum PredicatePattern<'script> {
 }
 
 impl<'script> PredicatePattern<'script> {
+    fn is_exclusive_to(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                PredicatePattern::Bin {
+                    lhs: lhs1,
+                    kind: BinOpKind::Eq,
+                    ..
+                },
+                PredicatePattern::Bin {
+                    lhs: lhs2,
+                    kind: BinOpKind::Eq,
+                    ..
+                },
+            ) if lhs1 == lhs2 => true,
+            _ => false,
+        }
+    }
     /// Get key
     #[must_use]
     pub fn key(&self) -> &KnownKey<'script> {
@@ -1488,6 +1749,20 @@ pub struct RecordPattern<'script> {
     /// Pattern fields
     pub fields: PatternFields<'script>,
 }
+
+impl<'script> RecordPattern<'script> {
+    fn is_exclusive_to(&self, other: &Self) -> bool {
+        if self.fields.len() == 1 && other.fields.len() == 1 {
+            self.fields
+                .get(0)
+                .and_then(|f1| Some((f1, other.fields.get(0)?)))
+                .map(|(f1, f2)| f1.is_exclusive_to(f2))
+                .unwrap_or_default()
+        } else {
+            false
+        }
+    }
+}
 impl_expr_mid!(RecordPattern);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1501,6 +1776,17 @@ pub enum ArrayPredicatePattern<'script> {
     Record(RecordPattern<'script>),
     /// Don't care condition
     Ignore,
+}
+
+impl<'script> ArrayPredicatePattern<'script> {
+    fn is_exclusive_to(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ArrayPredicatePattern::Record(r1), ArrayPredicatePattern::Record(r2)) => {
+                r1.is_exclusive_to(r2) || r2.is_exclusive_to(r1)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1636,7 +1922,7 @@ pub enum Segment<'script> {
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Default)]
 /// A path local to the current program
 pub struct LocalPath<'script> {
     /// Local Index
@@ -1875,8 +2161,8 @@ pub type ImutExprs<'script> = Vec<ImutExpr<'script>>;
 pub(crate) type Fields<'script> = Vec<Field<'script>>;
 pub(crate) type Segments<'script> = Vec<Segment<'script>>;
 pub(crate) type PatternFields<'script> = Vec<PredicatePattern<'script>>;
-pub(crate) type Predicates<'script> = Vec<PredicateClause<'script>>;
-pub(crate) type ImutPredicates<'script> = Vec<ImutPredicateClause<'script>>;
+pub(crate) type Predicates<'script> = Vec<ClauseGroup<'script>>;
+pub(crate) type ImutPredicates<'script> = Vec<ImutClauseGroup<'script>>;
 pub(crate) type PatchOperations<'script> = Vec<PatchOperation<'script>>;
 pub(crate) type ComprehensionCases<'script> = Vec<ComprehensionCase<'script>>;
 pub(crate) type ImutComprehensionCases<'script> = Vec<ImutComprehensionCase<'script>>;
@@ -1901,10 +2187,8 @@ fn replace_last_shadow_use<'script>(replace_idx: usize, expr: Expr<'script>) -> 
             let mut m: Match<'script> = *m;
 
             // In each pattern we can replace the use in the last assign
-            for p in &mut m.patterns {
-                if let Some(expr) = p.exprs.pop() {
-                    p.exprs.push(replace_last_shadow_use(replace_idx, expr))
-                }
+            for cg in &mut m.patterns {
+                cg.replace_last_shadow_use(replace_idx);
             }
 
             Expr::Match(Box::new(m))

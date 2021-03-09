@@ -18,13 +18,13 @@
 
 use super::{
     base_expr, path_eq, query, replace_last_shadow_use, ArrayPattern, ArrayPredicatePattern,
-    AssignPattern, BinExpr, BinOpKind, Bytes, Comprehension, ComprehensionCase, EmitExpr,
-    EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, ImutComprehension, ImutComprehensionCase,
-    ImutExpr, ImutExprInt, ImutMatch, ImutPredicateClause, Invocable, Invoke, InvokeAggr,
-    InvokeAggrFn, List, Literal, LocalPath, Match, Merge, MetadataPath, ModDoc, NodeMetas, Patch,
-    PatchOperation, Path, Pattern, PredicateClause, PredicatePattern, Predicates, Record,
-    RecordPattern, Recur, ReservedPath, Script, Segment, StatePath, StrLitElement, StringLit,
-    TestExpr, TuplePattern, UnaryExpr, UnaryOpKind, Warning,
+    AssignPattern, BinExpr, BinOpKind, Bytes, ClauseGroup, Comprehension, ComprehensionCase,
+    EmitExpr, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, ImutClauseGroup,
+    ImutComprehension, ImutComprehensionCase, ImutExpr, ImutExprInt, ImutMatch,
+    ImutPredicateClause, Invocable, Invoke, InvokeAggr, InvokeAggrFn, List, Literal, LocalPath,
+    Match, Merge, MetadataPath, ModDoc, NodeMetas, Patch, PatchOperation, Path, Pattern,
+    PredicateClause, PredicatePattern, Record, RecordPattern, Recur, ReservedPath, Script, Segment,
+    StatePath, StrLitElement, StringLit, TestExpr, TuplePattern, UnaryExpr, UnaryOpKind, Warning,
 };
 use super::{upable::Upable, BytesPart};
 use crate::errors::{
@@ -2282,7 +2282,7 @@ impl_expr!(MatchRaw);
 impl<'script> Upable<'script> for MatchRaw<'script> {
     type Target = Match<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        let patterns: Predicates = self
+        let patterns: Vec<PredicateClause> = self
             .patterns
             .into_iter()
             .map(|v| v.up(helper))
@@ -2309,10 +2309,41 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
             _ => ()
         }
 
+        let mut groups = Vec::new();
+        let mut group = Vec::new();
+
+        for p in patterns {
+            if group.is_empty() {
+                group.push(p);
+            } else {
+                if group
+                    .iter()
+                    .all(|g| p.is_exclusive_to(g) || g.is_exclusive_to(&p))
+                {
+                    group.push(p);
+                } else {
+                    let mut g = ClauseGroup::Simple {
+                        patterns: group,
+                        precondition: None,
+                    };
+                    g.optimize();
+                    groups.push(g);
+                    group = Vec::new();
+                    group.push(p);
+                }
+            }
+        }
+        let mut g = ClauseGroup::Simple {
+            patterns: group,
+            precondition: None,
+        };
+        g.optimize();
+        groups.push(g);
+
         Ok(Match {
             mid: helper.add_meta(self.start, self.end),
             target: self.target.up(helper)?,
-            patterns,
+            patterns: groups,
         })
     }
 }
@@ -2350,7 +2381,7 @@ impl<'script> Upable<'script> for ImutMatchRaw<'script> {
         let r = Ok(ImutMatch {
             mid: helper.add_meta(self.start, self.end),
             target: self.target.up(helper)?,
-            patterns,
+            patterns: vec![ImutClauseGroup { patterns }],
         });
         helper.possible_leaf = was_leaf;
         r
