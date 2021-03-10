@@ -257,6 +257,64 @@ impl fmt::Display for ExtractorError {
 }
 
 impl Extractor {
+    pub fn cost(&self) -> u64 {
+        match self {
+            Extractor::Glob { .. } => 100,
+            Extractor::Re { .. } => 1000,
+            Extractor::Rerg { .. } => 1000,
+            Extractor::Base64 => 50,
+            Extractor::Kv(_) => 500,
+            Extractor::Json => 500,
+            Extractor::Dissect { .. } => 500,
+            Extractor::Grok { .. } => 50,
+            Extractor::Cidr { .. } => 200,
+            Extractor::Influx => 750,
+            Extractor::Datetime { .. } => 200,
+        }
+    }
+    /// This is affected only if we use == compairisons
+    pub fn is_exclusive_to(&self, value: &Value) -> bool {
+        if let Some(s) = value.as_str() {
+            match self {
+                // If the glob pattern does not match the string we compare to,
+                // we know that the two are exclusive
+                // match event of
+                //   case %{a ~= glob|my*glob|} => ...
+                //   case %{a == "snot"} => ...
+                // end
+                // the same holds true for regular expressions
+                Extractor::Glob { compiled, .. } => !compiled.matches(s),
+                Extractor::Rerg { compiled, .. } | Extractor::Re { compiled, .. } => {
+                    !compiled.is_match(s)
+                }
+                Extractor::Base64 => base64::decode(s).is_err(),
+                Extractor::Kv(p) => p.run::<Value>(s).is_none(),
+                Extractor::Json => {
+                    let mut s = String::from(s);
+                    let r = {
+                        let s1 = s.as_mut_str();
+                        // ALLOW: This is a temporary value
+                        let s2 = unsafe { s1.as_bytes_mut() };
+                        tremor_value::parse_to_value(s2).is_err()
+                    };
+                    r
+                }
+                Extractor::Dissect { compiled, .. } => {
+                    let mut s = String::from(s);
+                    compiled.run(s.as_mut_str()).is_none()
+                }
+                Extractor::Grok { compiled, .. } => compiled.matches(s.as_bytes()).is_err(),
+                Extractor::Cidr { .. } => IpAddr::from_str(s).is_err(),
+                Extractor::Influx => influx::decode::<Value>(s, 0).is_err(),
+                Extractor::Datetime {
+                    format,
+                    has_timezone,
+                } => datetime::_parse(s, format, *has_timezone).is_err(),
+            }
+        } else {
+            true
+        }
+    }
     pub fn new(id: &str, rule_text: &str) -> Result<Self, ExtractorError> {
         let id = id.to_lowercase();
         let e = match id.as_str() {

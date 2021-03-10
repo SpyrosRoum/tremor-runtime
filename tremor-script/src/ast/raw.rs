@@ -2279,10 +2279,25 @@ pub struct MatchRaw<'script> {
 }
 impl_expr!(MatchRaw);
 
+// Sort clauses, move up cheaper clouses as long as they're exclusive
+#[allow(dead_code)]
+fn sort_clauses(patterns: &mut [PredicateClause]) {
+    for i in (0..patterns.len()).rev() {
+        for j in (1..=i).rev() {
+            if (patterns[j].is_exclusive_to(&patterns[j - 1])
+                || patterns[j - 1].is_exclusive_to(&patterns[j]))
+                && patterns[j].cost() <= patterns[j - 1].cost()
+            {
+                patterns.swap(j, j - 1)
+            }
+        }
+    }
+}
+
 impl<'script> Upable<'script> for MatchRaw<'script> {
     type Target = Match<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        let patterns: Vec<PredicateClause> = self
+        let mut patterns: Vec<PredicateClause> = self
             .patterns
             .into_iter()
             .map(|v| v.up(helper))
@@ -2308,7 +2323,7 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
 
             _ => ()
         }
-
+        sort_clauses(&mut patterns);
         let mut groups = Vec::new();
         let mut group = Vec::new();
 
@@ -2322,6 +2337,8 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
                 {
                     group.push(p);
                 } else {
+                    group.sort_by_key(|c| c.cost());
+
                     let mut g = ClauseGroup::Simple {
                         patterns: group,
                         precondition: None,
@@ -2333,13 +2350,14 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
                 }
             }
         }
+        group.sort_by_key(|c| c.cost());
         let mut g = ClauseGroup::Simple {
             patterns: group,
             precondition: None,
         };
         g.optimize();
         groups.push(g);
-
+        // dbg!(&groups);
         Ok(Match {
             mid: helper.add_meta(self.start, self.end),
             target: self.target.up(helper)?,

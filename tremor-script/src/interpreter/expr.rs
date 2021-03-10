@@ -133,13 +133,26 @@ where
                                 }
                             }
                         }
-                        ClauseGroup::SearchTree { tree, .. } => {
+                        ClauseGroup::SearchTree { tree, rest, .. } => {
                             let target: &Value<'event> = target.as_ref();
                             let target: &Value<'script> = unsafe { mem::transmute(target) };
                             if let Some((e, l)) = tree.get(&target) {
                                 return Self::execute_effectors(
                                     opts, env, event, state, meta, local, e, l,
                                 );
+                            };
+                            for predicate in rest {
+                                let p = &predicate.pattern;
+                                let g = &predicate.guard;
+                                if stry!(test_predicate_expr(
+                                    self, opts, env, event, state, meta, local, &target, p, g,
+                                )) {
+                                    let e = &predicate.exprs;
+                                    let l = &predicate.last_expr;
+                                    return Self::execute_effectors(
+                                        opts, env, event, state, meta, local, e, l,
+                                    );
+                                }
                             }
                         }
                     };
@@ -164,13 +177,26 @@ where
                             }
                         }
                     }
-                    ClauseGroup::SearchTree { tree, .. } => {
+                    ClauseGroup::SearchTree { tree, rest, .. } => {
                         let target: &Value<'event> = target.as_ref();
                         let target: &Value<'script> = unsafe { mem::transmute(target) };
                         if let Some((e, l)) = tree.get(&target) {
                             return Self::execute_effectors(
                                 opts, env, event, state, meta, local, e, l,
                             );
+                        }
+                        for predicate in rest {
+                            let p = &predicate.pattern;
+                            let g = &predicate.guard;
+                            if stry!(test_predicate_expr(
+                                self, opts, env, event, state, meta, local, &target, p, g,
+                            )) {
+                                let e = &predicate.exprs;
+                                let l = &predicate.last_expr;
+                                return Self::execute_effectors(
+                                    opts, env, event, state, meta, local, e, l,
+                                );
+                            }
                         }
                     }
                 };

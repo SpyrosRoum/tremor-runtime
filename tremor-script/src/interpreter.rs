@@ -983,6 +983,13 @@ where
 {
     let opts_wo = opts.without_result();
     match pattern {
+        Pattern::Extract(test) => {
+            if test.extractor.extract(false, &target, &env.context).is_ok() {
+                test_guard(outer, opts, env, event, state, meta, local, guard)
+            } else {
+                return Ok(false);
+            }
+        }
         Pattern::DoNotCare => test_guard(outer, opts, env, event, state, meta, local, guard),
         Pattern::Tuple(ref tp) => {
             if stry!(match_tp_expr(
@@ -1030,6 +1037,16 @@ where
             let opts_w = opts.with_result();
 
             match *a.pattern {
+                Pattern::Extract(ref test) => {
+                    if let Ok(v) = test.extractor.extract(true, &target, &env.context) {
+                        // we need to assign prior to the guard so we can check
+                        // against the pattern expressions
+                        stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
+                        test_guard(outer, opts, env, event, state, meta, local, guard)
+                    } else {
+                        return Ok(false);
+                    }
+                }
                 Pattern::DoNotCare => {
                     test_guard(outer, opts, env, event, state, meta, local, guard)
                 }

@@ -1154,6 +1154,12 @@ pub struct TestExpr {
     pub extractor: Extractor,
 }
 
+impl TestExpr {
+    fn cost(&self) -> u64 {
+        self.extractor.cost()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates a match expression form
 pub struct Match<'script> {
@@ -1201,6 +1207,8 @@ pub enum ClauseGroup<'script> {
         precondition: Option<ClausePreCondition<'script>>,
         /// Clauses in a group
         tree: BTreeMap<Value<'script>, (Vec<Expr<'script>>, Expr<'script>)>,
+        /// Non tree patterns
+        rest: Vec<PredicateClause<'script>>,
     },
 }
 
@@ -1268,22 +1276,23 @@ impl<'script> ClauseGroup<'script> {
                             .get(0)
                             .map(|f| {
                                 // where the record key is a binary equal
-                                if let PredicatePattern::Bin {
-                                    kind: BinOpKind::Eq,
-                                    key,
-                                    ..
-                                } = f
-                                {
-                                    // and the key of this equal is the same in all patterns
-                                    if let Some(first) = &first_key {
-                                        first == key
-                                    } else {
-                                        first_key = Some(key.clone());
-                                        // this is the first item so we can assume so far it's all OK
-                                        true
+                                match f {
+                                    PredicatePattern::Bin {
+                                        kind: BinOpKind::Eq,
+                                        key,
+                                        ..
                                     }
-                                } else {
-                                    false
+                                    | PredicatePattern::TildeEq { key, .. } => {
+                                        // and the key of this equal is the same in all patterns
+                                        if let Some(first) = &first_key {
+                                            first == key
+                                        } else {
+                                            first_key = Some(key.clone());
+                                            // this is the first item so we can assume so far it's all OK
+                                            true
+                                        }
+                                    }
+                                    _ => false,
                                 }
                             })
                             .unwrap_or_default()
@@ -1316,59 +1325,72 @@ impl<'script> ClauseGroup<'script> {
                     // match event.a of ...
 
                     for pattern in patterns {
-                        let p = if let PredicateClause {
-                            pattern: Pattern::Record(RecordPattern { fields, .. }),
-                            ..
-                        } = pattern
-                        {
-                            if let Some(PredicatePattern::Bin { rhs, .. }) = fields.pop() {
-                                Some(Pattern::Expr(rhs))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                        let p = match pattern {
+                            PredicateClause {
+                                pattern: Pattern::Record(RecordPattern { fields, .. }),
+                                ..
+                            } => match fields.pop() {
+                                Some(PredicatePattern::Bin { rhs, .. }) => Some(Pattern::Expr(rhs)),
+                                Some(PredicatePattern::TildeEq { test, .. }) => {
+                                    Some(Pattern::Extract(test))
+                                }
+                                other => {
+                                    eprintln!("this should never happen, we only expect predicate patterns: {:?}", other);
+                                    None
+                                }
+                            },
+                            _ => None,
                         };
+
                         if let Some(p) = p {
                             pattern.pattern = p
                         }
                     }
                 }
                 self.optimize();
-            } else if patterns.iter().all(|p| {
-                if let PredicateClause {
-                    pattern: Pattern::Expr(ImutExprInt::Literal(_)),
-                    guard: None,
-                    ..
-                } = p
-                {
-                    true
-                } else {
-                    false
-                }
-            }) {
+            } else if patterns
+                .iter()
+                .filter(|p| {
+                    if let PredicateClause {
+                        pattern: Pattern::Expr(ImutExprInt::Literal(_)),
+                        guard: None,
+                        ..
+                    } = p
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .count()
+                > 2
+            {
                 println!("tree optimize: {}", patterns.len()); // FIXME
                                                                // We swap out the precondition and patterns so we can construct a new self
                 let mut precondition1 = None;
                 mem::swap(&mut precondition1, precondition);
                 let mut patterns1 = Vec::new();
                 mem::swap(&mut patterns1, patterns);
+                let mut rest = Vec::new();
 
                 let mut tree = BTreeMap::new();
                 for p in patterns1 {
-                    if let PredicateClause {
-                        pattern: Pattern::Expr(ImutExprInt::Literal(Literal { value, .. })),
-                        exprs,
-                        last_expr,
-                        ..
-                    } = p
-                    {
-                        tree.insert(value, (exprs, last_expr));
+                    match p {
+                        PredicateClause {
+                            pattern: Pattern::Expr(ImutExprInt::Literal(Literal { value, .. })),
+                            exprs,
+                            last_expr,
+                            ..
+                        } => {
+                            tree.insert(value, (exprs, last_expr));
+                        }
+                        _ => rest.push(p),
                     }
                 }
                 *self = Self::SearchTree {
                     precondition: precondition1,
-                    tree: tree,
+                    tree,
+                    rest,
                 }
             }
         }
@@ -1399,6 +1421,10 @@ impl<'script> PredicateClause<'script> {
         } else {
             self.pattern.is_exclusive_to(&other.pattern)
         }
+    }
+    fn cost(&self) -> u64 {
+        let g = if self.guard.is_some() { 10 } else { 0 };
+        g + self.pattern.cost()
     }
 }
 
@@ -1586,6 +1612,8 @@ pub enum Pattern<'script> {
     Assign(AssignPattern<'script>),
     /// Tuple pattern
     Tuple(TuplePattern<'script>),
+    /// A extractor
+    Extract(Box<TestExpr>),
     /// Don't care condition
     DoNotCare,
     /// Gates if no other pattern matches
@@ -1597,6 +1625,18 @@ impl<'script> Pattern<'script> {
     }
     fn is_assign(&self) -> bool {
         matches!(self, Pattern::Assign(_))
+    }
+    fn cost(&self) -> u64 {
+        match self {
+            Pattern::Expr(_) => 10,
+            Pattern::Record(r) => r.cost(),
+            Pattern::Array(a) => a.cost(),
+            Pattern::Assign(a) => a.cost(),
+            Pattern::Tuple(t) => t.cost(),
+            Pattern::Extract(e) => e.cost(),
+            Pattern::DoNotCare => 0,
+            Pattern::Default => 0,
+        }
     }
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1693,6 +1733,20 @@ pub enum PredicatePattern<'script> {
 }
 
 impl<'script> PredicatePattern<'script> {
+    fn cost(&self) -> u64 {
+        match self {
+            PredicatePattern::TildeEq { test, .. } => test.cost(),
+            PredicatePattern::Bin {
+                rhs: ImutExprInt::Literal(_),
+                ..
+            } => 20,
+            PredicatePattern::Bin { .. } => 100,
+            PredicatePattern::RecordPatternEq { pattern, .. } => pattern.cost(),
+            PredicatePattern::ArrayPatternEq { pattern, .. } => pattern.cost(),
+            PredicatePattern::FieldPresent { .. } => 10,
+            PredicatePattern::FieldAbsent { .. } => 10,
+        }
+    }
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1707,7 +1761,57 @@ impl<'script> PredicatePattern<'script> {
                     ..
                 },
             ) if lhs1 == lhs2 => true,
-            _ => false,
+            (
+                PredicatePattern::Bin { lhs: lhs1, .. },
+                PredicatePattern::FieldAbsent { lhs: lhs2, .. },
+            ) if lhs1 == lhs2 => true,
+            (
+                PredicatePattern::FieldPresent { lhs: lhs1, .. },
+                PredicatePattern::FieldAbsent { lhs: lhs2, .. },
+            ) if lhs1 == lhs2 => true,
+            (
+                PredicatePattern::Bin {
+                    lhs: lhs1,
+                    kind: BinOpKind::Eq,
+                    rhs: ImutExprInt::Literal(Literal { value, .. }),
+                    ..
+                },
+                PredicatePattern::TildeEq {
+                    lhs: lhs2, test, ..
+                },
+            ) if lhs1 == lhs2 => {
+                if test.extractor.is_exclusive_to(value) {
+                    true
+                } else {
+                    eprintln!("{:?} % {:?}", value, test);
+
+                    false
+                }
+            }
+            (
+                PredicatePattern::TildeEq {
+                    lhs: lhs2, test, ..
+                },
+                PredicatePattern::Bin {
+                    lhs: lhs1,
+                    kind: BinOpKind::Eq,
+                    rhs: ImutExprInt::Literal(Literal { value, .. }),
+                    ..
+                },
+            ) if lhs1 == lhs2 => {
+                if test.extractor.is_exclusive_to(value) {
+                    true
+                } else {
+                    eprintln!("{:?} % {:?}", value, test);
+
+                    false
+                }
+            }
+            (PredicatePattern::TildeEq { .. }, PredicatePattern::TildeEq { .. }) => false,
+            (l, r) => {
+                eprintln!("{:?} % {:?}", l, r);
+                false
+            }
         }
     }
     /// Get key
@@ -1751,12 +1855,16 @@ pub struct RecordPattern<'script> {
 }
 
 impl<'script> RecordPattern<'script> {
+    fn cost(&self) -> u64 {
+        self.fields.iter().map(|f| f.cost() + 100).sum()
+    }
+
     fn is_exclusive_to(&self, other: &Self) -> bool {
         if self.fields.len() == 1 && other.fields.len() == 1 {
             self.fields
                 .get(0)
                 .and_then(|f1| Some((f1, other.fields.get(0)?)))
-                .map(|(f1, f2)| f1.is_exclusive_to(f2))
+                .map(|(f1, f2)| f1.is_exclusive_to(f2) || f2.is_exclusive_to(f1))
                 .unwrap_or_default()
         } else {
             false
@@ -1779,6 +1887,16 @@ pub enum ArrayPredicatePattern<'script> {
 }
 
 impl<'script> ArrayPredicatePattern<'script> {
+    fn cost(&self) -> u64 {
+        match self {
+            ArrayPredicatePattern::Expr(ImutExprInt::Literal(_)) => 10,
+            ArrayPredicatePattern::Expr(_) => 10,
+            ArrayPredicatePattern::Tilde(t) => t.cost(),
+            ArrayPredicatePattern::Record(r) => r.cost(),
+            ArrayPredicatePattern::Ignore => 1,
+        }
+    }
+
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayPredicatePattern::Record(r1), ArrayPredicatePattern::Record(r2)) => {
@@ -1797,6 +1915,14 @@ pub struct ArrayPattern<'script> {
     /// Predicates
     pub exprs: ArrayPredicatePatterns<'script>,
 }
+
+impl<'script> ArrayPattern<'script> {
+    fn cost(&self) -> u64 {
+        let s: u64 = self.exprs.iter().map(|f| f.cost()).sum();
+
+        s * (self.exprs.len() as u64)
+    }
+}
 impl_expr_mid!(ArrayPattern);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1810,6 +1936,12 @@ pub struct AssignPattern<'script> {
     pub pattern: Box<Pattern<'script>>,
 }
 
+impl<'script> AssignPattern<'script> {
+    fn cost(&self) -> u64 {
+        self.pattern.cost()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates a positional tuple pattern
 pub struct TuplePattern<'script> {
@@ -1819,6 +1951,12 @@ pub struct TuplePattern<'script> {
     pub exprs: ArrayPredicatePatterns<'script>,
     /// True, if the pattern supports variable arguments
     pub open: bool,
+}
+
+impl<'script> TuplePattern<'script> {
+    fn cost(&self) -> u64 {
+        self.exprs.iter().map(|f| f.cost()).sum()
+    }
 }
 impl_expr_mid!(TuplePattern);
 
