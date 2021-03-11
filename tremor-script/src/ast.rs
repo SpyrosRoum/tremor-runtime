@@ -827,6 +827,8 @@ fn path_eq<'script>(path: &Path<'script>, expr: &ImutExprInt<'script>) -> bool {
 pub enum Expr<'script> {
     /// Match expression
     Match(Box<Match<'script>>),
+    /// IfElse style match expression
+    IfElse(Box<IfElse<'script>>),
     /// In place patch expression
     PatchInPlace(Box<Patch<'script>>),
     /// In place merge expression
@@ -1160,8 +1162,26 @@ impl TestExpr {
     }
 }
 
+/// default case for a match expression
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum DefaultCase<'script> {
+    /// No default case
+    None,
+    /// Null default case (default => null)
+    Null,
+    /// Many expressions
+    Many {
+        /// Expressions in the clause
+        exprs: Vec<Expr<'script>>,
+        /// last expression in the clause
+        last_expr: Expr<'script>,
+    },
+    /// One Expression
+    One(Expr<'script>),
+}
+
 /// Encapsulates a match expression form
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Match<'script> {
     /// Id
     pub mid: usize,
@@ -1169,8 +1189,24 @@ pub struct Match<'script> {
     pub target: ImutExprInt<'script>,
     /// Patterns to match against the target
     pub patterns: Predicates<'script>,
+    /// Default case
+    pub default: DefaultCase<'script>,
 }
 impl_expr_mid!(Match);
+
+/// If / Else style match
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct IfElse<'script> {
+    /// Id
+    pub mid: usize,
+    /// The target of the match
+    pub target: ImutExprInt<'script>,
+    /// The if case
+    pub if_clause: PredicateClause<'script>,
+    /// Default/else case
+    pub else_clause: DefaultCase<'script>,
+}
+impl_expr_mid!(IfElse);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates an immutable match expression form
@@ -1210,6 +1246,13 @@ pub enum ClauseGroup<'script> {
         /// Non tree patterns
         rest: Vec<PredicateClause<'script>>,
     },
+    /// A Combination of multiple groups that share a precondition
+    Combined {
+        /// pre-condition for this group
+        precondition: Option<ClausePreCondition<'script>>,
+        /// Clauses in a group
+        groups: Vec<ClauseGroup<'script>>,
+    },
 }
 
 impl<'script> Default for ClauseGroup<'script> {
@@ -1222,12 +1265,65 @@ impl<'script> Default for ClauseGroup<'script> {
 }
 
 impl<'script> ClauseGroup<'script> {
+    fn combinable(&self, other: &Self) -> bool {
+        self.precondition() == other.precondition() && self.precondition().is_some()
+    }
+    fn combine(&mut self, other: Self) {
+        match (self, other) {
+            (
+                Self::Combined {
+                    groups: patterns, ..
+                },
+                Self::Combined {
+                    groups: mut other_groups,
+                    ..
+                },
+            ) => patterns.append(&mut other_groups),
+            (
+                Self::Combined {
+                    groups: patterns, ..
+                },
+                mut other,
+            ) => {
+                other.clear_precondition();
+                patterns.push(other)
+            }
+            (this, other) => {
+                // Swap out precondition
+                let mut precondition = None;
+                mem::swap(&mut precondition, this.precondition_mut());
+                // Set up new combined self
+                let mut new = Self::Combined {
+                    groups: Vec::with_capacity(2),
+                    precondition,
+                };
+                mem::swap(&mut new, this);
+                // combine old self into new self
+                this.combine(new);
+                // combine other into new self
+                this.combine(other);
+            }
+        }
+    }
+    fn clear_precondition(&mut self) {
+        *(self.precondition_mut()) = None
+    }
+
     pub(crate) fn precondition(&self) -> Option<&ClausePreCondition<'script>> {
         match self {
             ClauseGroup::Simple { precondition, .. } => precondition.as_ref(),
             ClauseGroup::SearchTree { precondition, .. } => precondition.as_ref(),
+            ClauseGroup::Combined { precondition, .. } => precondition.as_ref(),
         }
     }
+    pub(crate) fn precondition_mut(&mut self) -> &mut Option<ClausePreCondition<'script>> {
+        match self {
+            ClauseGroup::Simple { precondition, .. } => precondition,
+            ClauseGroup::SearchTree { precondition, .. } => precondition,
+            ClauseGroup::Combined { precondition, .. } => precondition,
+        }
+    }
+
     fn replace_last_shadow_use(&mut self, replace_idx: usize) {
         match self {
             Self::Simple { patterns, .. } => {
@@ -1238,12 +1334,22 @@ impl<'script> ClauseGroup<'script> {
                     }
                 }
             }
-            Self::SearchTree { tree, .. } => {
+            Self::SearchTree { tree, rest, .. } => {
                 // FIXME (is this correct) or should we use the last expr?
                 for p in tree.values_mut() {
                     if let Some(expr) = p.0.pop() {
                         p.0.push(replace_last_shadow_use(replace_idx, expr))
                     }
+                }
+                for p in rest {
+                    if let Some(expr) = p.exprs.pop() {
+                        p.exprs.push(replace_last_shadow_use(replace_idx, expr))
+                    }
+                }
+            }
+            Self::Combined { groups, .. } => {
+                for cg in groups {
+                    cg.replace_last_shadow_use(replace_idx)
                 }
             }
         }
@@ -1255,53 +1361,40 @@ impl<'script> ClauseGroup<'script> {
         } = self
         {
             let mut first_key = None;
-            let count = patterns.len();
-            // return if we have only 1 pattern or less to optimize
-            if count <= 1 {
-                return;
-            };
-            // if all patterns
 
+            // if all patterns
             if patterns.iter().all(|p| {
-                // are record patterns
-                if let PredicateClause {
-                    pattern: Pattern::Record(RecordPattern { fields, .. }),
-                    ..
-                } = p
-                {
-                    // there are no additional fields looked at
-                    let is_one_element = fields.len() == 1;
-                    is_one_element
-                        && fields
-                            .get(0)
-                            .map(|f| {
-                                // where the record key is a binary equal
-                                match f {
-                                    PredicatePattern::Bin {
-                                        kind: BinOpKind::Eq,
-                                        key,
-                                        ..
-                                    }
-                                    | PredicatePattern::TildeEq { key, .. } => {
-                                        // and the key of this equal is the same in all patterns
-                                        if let Some(first) = &first_key {
-                                            first == key
-                                        } else {
-                                            first_key = Some(key.clone());
-                                            // this is the first item so we can assume so far it's all OK
-                                            true
-                                        }
-                                    }
-                                    _ => false,
+                match p {
+                    PredicateClause {
+                        pattern: Pattern::Record(RecordPattern { fields, .. }),
+                        ..
+                    } if fields.len() == 1 => fields
+                        .get(0)
+                        .map(|f| {
+                            // where the record key is a binary equal
+                            match f {
+                                PredicatePattern::Bin {
+                                    kind: BinOpKind::Eq,
+                                    key,
+                                    ..
                                 }
-                            })
-                            .unwrap_or_default()
-                } else {
-                    false
+                                | PredicatePattern::TildeEq { key, .. } => {
+                                    // and the key of this equal is the same in all patterns
+                                    if let Some(first) = &first_key {
+                                        first == key
+                                    } else {
+                                        first_key = Some(key.clone());
+                                        // this is the first item so we can assume so far it's all OK
+                                        true
+                                    }
+                                }
+                                _ => false,
+                            }
+                        })
+                        .unwrap_or_default(),
+                    _ => false,
                 }
             }) {
-                println!("optimize: {}", patterns.len()); // FIXME
-
                 // optimisation for:
                 // match event of
                 //   case %{a == "b"} =>...
@@ -1313,10 +1406,12 @@ impl<'script> ClauseGroup<'script> {
                 //   case "c" =>...
                 // end;
                 if let Some(key) = &first_key {
+                    println!("optimize (precondition): {}", patterns.len()); // FIXME
+
                     // We want to make sure that our key exists
                     *precondition = Some(ClausePreCondition {
                         segments: vec![Segment::Id {
-                            mid: 0,
+                            mid: 0, //FIXME
                             key: key.clone(),
                         }],
                     });

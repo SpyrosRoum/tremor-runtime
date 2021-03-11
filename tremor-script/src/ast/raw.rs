@@ -19,8 +19,8 @@
 use super::{
     base_expr, path_eq, query, replace_last_shadow_use, ArrayPattern, ArrayPredicatePattern,
     AssignPattern, BinExpr, BinOpKind, Bytes, ClauseGroup, Comprehension, ComprehensionCase,
-    EmitExpr, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, ImutClauseGroup,
-    ImutComprehension, ImutComprehensionCase, ImutExpr, ImutExprInt, ImutMatch,
+    DefaultCase, EmitExpr, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, IfElse,
+    ImutClauseGroup, ImutComprehension, ImutComprehensionCase, ImutExpr, ImutExprInt, ImutMatch,
     ImutPredicateClause, Invocable, Invoke, InvokeAggr, InvokeAggrFn, List, Literal, LocalPath,
     Match, Merge, MetadataPath, ModDoc, NodeMetas, Patch, PatchOperation, Path, Pattern,
     PredicateClause, PredicatePattern, Record, RecordPattern, Recur, ReservedPath, Script, Segment,
@@ -581,7 +581,50 @@ impl<'script> Upable<'script> for ExprRaw<'script> {
                 )
                 .into());
             }
-            ExprRaw::MatchExpr(m) => Expr::Match(Box::new(m.up(helper)?)),
+            ExprRaw::MatchExpr(m) => match m.up(helper)? {
+                Match {
+                    mid,
+                    target,
+                    mut patterns,
+                    default,
+                } if patterns.len() == 1
+                    && patterns
+                        .get(0)
+                        .map(|cg| {
+                            if let ClauseGroup::Simple {
+                                precondition: None,
+                                patterns,
+                            } = cg
+                            {
+                                patterns.len() == 1
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or_default() =>
+                {
+                    if let Some(ClauseGroup::Simple {
+                        precondition: None,
+                        mut patterns,
+                    }) = patterns.pop()
+                    {
+                        if let Some(if_clause) = patterns.pop() {
+                            let ie = IfElse {
+                                mid,
+                                target,
+                                if_clause,
+                                else_clause: default,
+                            };
+                            Expr::IfElse(Box::new(ie))
+                        } else {
+                            unreachable!()
+                        }
+                    } else {
+                        unreachable!()
+                    }
+                }
+                m => Expr::Match(Box::new(m)),
+            },
             ExprRaw::Assign(a) => {
                 let path = a.path.up(helper)?;
                 let mid = helper.add_meta(a.start, a.end);
@@ -2322,6 +2365,56 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
             }),
 
             _ => ()
+        };
+        // If the last statement is a global default we can simply remove it
+        let default = if let Some(PredicateClause {
+            pattern: Pattern::Default,
+            guard: None,
+            exprs,
+            last_expr,
+            ..
+        }) = patterns.last_mut()
+        {
+            let mut es = Vec::new();
+            let mut last = Expr::Drop { mid: 0 };
+            std::mem::swap(exprs, &mut es);
+            std::mem::swap(last_expr, &mut last);
+            if !exprs.is_empty() {
+                DefaultCase::Many {
+                    exprs: es,
+                    last_expr: last,
+                }
+            } else {
+                match last {
+                    Expr::Imut(ImutExprInt::Literal(Literal { value, .. })) if value.is_null() => {
+                        DefaultCase::Null
+                    }
+                    last => DefaultCase::One(last),
+                }
+            }
+        } else {
+            DefaultCase::None
+        };
+        if default != DefaultCase::None {
+            patterns.pop();
+        }
+
+        // This shortcuts for if / else style matches
+        if patterns.len() == 1 {
+            println!("if/else case");
+            let patterns = patterns
+                .into_iter()
+                .map(|p| ClauseGroup::Simple {
+                    precondition: None,
+                    patterns: vec![p],
+                })
+                .collect();
+            return Ok(Match {
+                mid: helper.add_meta(self.start, self.end),
+                target: self.target.up(helper)?,
+                patterns,
+                default,
+            });
         }
         sort_clauses(&mut patterns);
         let mut groups = Vec::new();
@@ -2357,11 +2450,27 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
         };
         g.optimize();
         groups.push(g);
-        // dbg!(&groups);
+
+        let mut patterns: Vec<ClauseGroup> = Vec::new();
+
+        let pre_combine = groups.len();
+        for g in groups {
+            if let Some(last) = patterns.last_mut() {
+                if last.combinable(&g) {
+                    last.combine(g);
+                } else {
+                    patterns.push(g);
+                }
+            } else {
+                patterns.push(g)
+            }
+        }
+        println!("combined: {} -> {}", pre_combine, patterns.len());
         Ok(Match {
             mid: helper.add_meta(self.start, self.end),
             target: self.target.up(helper)?,
-            patterns: groups,
+            patterns,
+            default,
         })
     }
 }

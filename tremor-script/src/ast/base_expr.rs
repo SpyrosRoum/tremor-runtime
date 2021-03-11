@@ -207,6 +207,7 @@ impl<'script> BaseExpr for Expr<'script> {
             Expr::Match(e) => e.mid(),
             Expr::MergeInPlace(e) => e.mid(),
             Expr::PatchInPlace(e) => e.mid(),
+            Expr::IfElse(e) => e.mid(),
         }
     }
 }

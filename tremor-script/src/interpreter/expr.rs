@@ -17,8 +17,8 @@ use super::{
     test_predicate_expr, Env, ExecOpts, LocalStack, NULL,
 };
 use crate::ast::{
-    BaseExpr, ClauseGroup, ClausePreCondition, Comprehension, EmitExpr, EventPath, Expr,
-    ImutExprInt, LocalPath, Match, Merge, Patch, Path, Segment,
+    BaseExpr, ClauseGroup, ClausePreCondition, Comprehension, DefaultCase, EmitExpr, EventPath,
+    Expr, IfElse, ImutExprInt, LocalPath, Match, Merge, Patch, Path, Segment,
 };
 use crate::errors::{
     error_assign_array, error_assign_to_const, error_bad_key, error_invalid_assign_target,
@@ -72,7 +72,7 @@ where
     'event: 'run,
 {
     #[inline]
-    fn execute_effectors(
+    pub(crate) fn execute_effectors(
         opts: ExecOpts,
         env: &'run Env<'run, 'event, 'script>,
         event: &'run mut Value<'event>,
@@ -104,7 +104,8 @@ where
         let target = stry!(expr.target.run(opts, env, event, state, meta, local));
 
         for cg in &expr.patterns {
-            if let Some(ClausePreCondition { segments, .. }) = cg.precondition() {
+            let maybe_target = if let Some(ClausePreCondition { segments, .. }) = cg.precondition()
+            {
                 if let Ok(target) = resolve_value(
                     self,
                     opts,
@@ -117,92 +118,160 @@ where
                     &target,
                     &segments,
                 ) {
-                    match cg {
-                        ClauseGroup::Simple { patterns, .. } => {
-                            for predicate in patterns {
-                                let p = &predicate.pattern;
-                                let g = &predicate.guard;
-                                if stry!(test_predicate_expr(
-                                    self, opts, env, event, state, meta, local, &target, p, g,
-                                )) {
-                                    let e = &predicate.exprs;
-                                    let l = &predicate.last_expr;
-                                    return Self::execute_effectors(
-                                        opts, env, event, state, meta, local, e, l,
-                                    );
-                                }
-                            }
-                        }
-                        ClauseGroup::SearchTree { tree, rest, .. } => {
-                            let target: &Value<'event> = target.as_ref();
-                            let target: &Value<'script> = unsafe { mem::transmute(target) };
-                            if let Some((e, l)) = tree.get(&target) {
-                                return Self::execute_effectors(
-                                    opts, env, event, state, meta, local, e, l,
-                                );
-                            };
-                            for predicate in rest {
-                                let p = &predicate.pattern;
-                                let g = &predicate.guard;
-                                if stry!(test_predicate_expr(
-                                    self, opts, env, event, state, meta, local, &target, p, g,
-                                )) {
-                                    let e = &predicate.exprs;
-                                    let l = &predicate.last_expr;
-                                    return Self::execute_effectors(
-                                        opts, env, event, state, meta, local, e, l,
-                                    );
-                                }
-                            }
-                        }
-                    };
+                    Some(target)
                 } else {
                     // We couldn't look up the value, it doesn't exist so we look at the next group
                     continue;
                 }
             } else {
-                match cg {
-                    ClauseGroup::Simple { patterns, .. } => {
-                        for predicate in patterns {
-                            let p = &predicate.pattern;
-                            let g = &predicate.guard;
-                            if stry!(test_predicate_expr(
-                                self, opts, env, event, state, meta, local, &target, p, g,
-                            )) {
-                                let e = &predicate.exprs;
-                                let l = &predicate.last_expr;
-                                return Self::execute_effectors(
-                                    opts, env, event, state, meta, local, e, l,
-                                );
-                            }
-                        }
-                    }
-                    ClauseGroup::SearchTree { tree, rest, .. } => {
-                        let target: &Value<'event> = target.as_ref();
-                        let target: &Value<'script> = unsafe { mem::transmute(target) };
-                        if let Some((e, l)) = tree.get(&target) {
-                            return Self::execute_effectors(
+                None
+            };
+            let target: &Value = if let Some(target) = maybe_target.as_ref() {
+                target
+            } else {
+                &target
+            };
+            match cg {
+                ClauseGroup::Simple { patterns, .. } => {
+                    for predicate in patterns {
+                        let p = &predicate.pattern;
+                        let g = &predicate.guard;
+                        if stry!(test_predicate_expr(
+                            expr, opts, env, event, state, meta, local, &target, p, g,
+                        )) {
+                            let e = &predicate.exprs;
+                            let l = &predicate.last_expr;
+                            return Expr::execute_effectors(
                                 opts, env, event, state, meta, local, e, l,
                             );
                         }
-                        for predicate in rest {
-                            let p = &predicate.pattern;
-                            let g = &predicate.guard;
-                            if stry!(test_predicate_expr(
-                                self, opts, env, event, state, meta, local, &target, p, g,
-                            )) {
-                                let e = &predicate.exprs;
-                                let l = &predicate.last_expr;
-                                return Self::execute_effectors(
-                                    opts, env, event, state, meta, local, e, l,
-                                );
+                    }
+                }
+                ClauseGroup::SearchTree { tree, rest, .. } => {
+                    let target: &Value<'script> = unsafe { mem::transmute(target) };
+                    if let Some((e, l)) = tree.get(&target) {
+                        return Expr::execute_effectors(opts, env, event, state, meta, local, e, l);
+                    }
+                    for predicate in rest {
+                        let p = &predicate.pattern;
+                        let g = &predicate.guard;
+                        if stry!(test_predicate_expr(
+                            expr, opts, env, event, state, meta, local, &target, p, g,
+                        )) {
+                            let e = &predicate.exprs;
+                            let l = &predicate.last_expr;
+                            return Expr::execute_effectors(
+                                opts, env, event, state, meta, local, e, l,
+                            );
+                        }
+                    }
+                }
+                ClauseGroup::Combined { groups, .. } => {
+                    // we have to inline this
+                    for cg in groups {
+                        match cg {
+                            ClauseGroup::Simple { patterns, .. } => {
+                                for predicate in patterns {
+                                    let p = &predicate.pattern;
+                                    let g = &predicate.guard;
+                                    if stry!(test_predicate_expr(
+                                        expr, opts, env, event, state, meta, local, &target, p, g,
+                                    )) {
+                                        let e = &predicate.exprs;
+                                        let l = &predicate.last_expr;
+                                        return Expr::execute_effectors(
+                                            opts, env, event, state, meta, local, e, l,
+                                        );
+                                    }
+                                }
+                            }
+                            ClauseGroup::SearchTree { tree, rest, .. } => {
+                                let target: &Value<'script> = unsafe { mem::transmute(target) };
+                                if let Some((e, l)) = tree.get(&target) {
+                                    return Expr::execute_effectors(
+                                        opts, env, event, state, meta, local, e, l,
+                                    );
+                                }
+                                for predicate in rest {
+                                    let p = &predicate.pattern;
+                                    let g = &predicate.guard;
+                                    if stry!(test_predicate_expr(
+                                        expr, opts, env, event, state, meta, local, &target, p, g,
+                                    )) {
+                                        let e = &predicate.exprs;
+                                        let l = &predicate.last_expr;
+                                        return Expr::execute_effectors(
+                                            opts, env, event, state, meta, local, e, l,
+                                        );
+                                    }
+                                }
+                            }
+                            ClauseGroup::Combined { .. } => {
+                                return Err(
+                                    "Nested combined clause groups are not permitted!".into()
+                                )
                             }
                         }
                     }
-                };
+                }
             };
         }
-        error_no_clause_hit(self, &env.meta)
+        // if let Some((e, l)) = &expr.default {
+        //     Expr::execute_effectors(opts, env, event, state, meta, local, e, l)
+        // } else {
+        //     error_no_clause_hit(self, &env.meta)
+        // }
+        match &expr.default {
+            DefaultCase::None => error_no_clause_hit(self, &env.meta),
+            DefaultCase::Null => Ok(Cont::Cont(Cow::Borrowed(&NULL))),
+            DefaultCase::Many { exprs, last_expr } => {
+                Expr::execute_effectors(opts, env, event, state, meta, local, exprs, last_expr)
+            }
+            DefaultCase::One(last_expr) => {
+                Expr::execute_effectors(opts, env, event, state, meta, local, &[], last_expr)
+            }
+        }
+    }
+
+    #[inline]
+    fn if_expr(
+        &'script self,
+        opts: ExecOpts,
+        env: &'run Env<'run, 'event, 'script>,
+        event: &'run mut Value<'event>,
+        state: &'run mut Value<'static>,
+        meta: &'run mut Value<'event>,
+        local: &'run mut LocalStack<'event>,
+        expr: &'script IfElse<'script>,
+    ) -> Result<Cont<'run, 'event>> {
+        let target = stry!(expr.target.run(opts, env, event, state, meta, local));
+        if stry!(test_predicate_expr(
+            expr,
+            opts,
+            env,
+            event,
+            state,
+            meta,
+            local,
+            &target,
+            &expr.if_clause.pattern,
+            &expr.if_clause.guard,
+        )) {
+            let e = &expr.if_clause.exprs;
+            let l = &expr.if_clause.last_expr;
+            Expr::execute_effectors(opts, env, event, state, meta, local, e, l)
+        } else {
+            match &expr.else_clause {
+                DefaultCase::None => error_no_clause_hit(self, &env.meta),
+                DefaultCase::Null => Ok(Cont::Cont(Cow::Borrowed(&NULL))),
+                DefaultCase::Many { exprs, last_expr } => {
+                    Expr::execute_effectors(opts, env, event, state, meta, local, exprs, last_expr)
+                }
+                DefaultCase::One(last_expr) => {
+                    Expr::execute_effectors(opts, env, event, state, meta, local, &[], last_expr)
+                }
+            }
+        }
     }
 
     #[allow(mutable_transmutes, clippy::transmute_ptr_to_ptr)]
@@ -625,6 +694,7 @@ where
                     .map(Cont::Cont)
             }
             Expr::Match(ref expr) => self.match_expr(opts, env, event, state, meta, local, expr),
+            Expr::IfElse(ref expr) => self.if_expr(opts, env, event, state, meta, local, expr),
             Expr::MergeInPlace(ref expr) => self
                 .merge_in_place(opts, env, event, state, meta, local, expr)
                 .map(Cont::Cont),

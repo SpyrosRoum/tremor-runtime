@@ -963,7 +963,7 @@ where
 
 #[inline]
 #[allow(clippy::too_many_lines)]
-fn test_predicate_expr<'run, 'event, 'script, Expr>(
+pub(crate) fn test_predicate_expr<'run, 'event, 'script, Expr>(
     outer: &'script Expr,
     opts: ExecOpts,
     env: &'run Env<'run, 'event, 'script>,
