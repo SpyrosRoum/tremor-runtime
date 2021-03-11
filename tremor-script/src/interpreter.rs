@@ -987,7 +987,7 @@ where
             if test.extractor.extract(false, &target, &env.context).is_ok() {
                 test_guard(outer, opts, env, event, state, meta, local, guard)
             } else {
-                return Ok(false);
+                Ok(false)
             }
         }
         Pattern::DoNotCare => test_guard(outer, opts, env, event, state, meta, local, guard),
@@ -1038,43 +1038,41 @@ where
 
             match *a.pattern {
                 Pattern::Extract(ref test) => {
-                    if let Ok(v) = test.extractor.extract(true, &target, &env.context) {
-                        // we need to assign prior to the guard so we can check
-                        // against the pattern expressions
-                        stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
-                        test_guard(outer, opts, env, event, state, meta, local, guard)
-                    } else {
-                        return Ok(false);
-                    }
+                    test.extractor
+                        .extract(true, &target, &env.context)
+                        .map_or(Ok(false), |v| {
+                            // we need to assign prior to the guard so we can check
+                            // against the pattern expressions
+                            stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
+                            test_guard(outer, opts, env, event, state, meta, local, guard)
+                        })
                 }
                 Pattern::DoNotCare => {
                     test_guard(outer, opts, env, event, state, meta, local, guard)
                 }
                 Pattern::Array(ref ap) => {
-                    if let Some(v) = stry!(match_ap_expr(
+                    stry!(match_ap_expr(
                         outer, opts_w, env, event, state, meta, local, &target, &ap,
-                    )) {
+                    ))
+                    .map_or(Ok(false), |v| {
                         // we need to assign prior to the guard so we can check
                         // against the pattern expressions
                         stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
 
                         test_guard(outer, opts, env, event, state, meta, local, guard)
-                    } else {
-                        Ok(false)
-                    }
+                    })
                 }
                 Pattern::Record(ref rp) => {
-                    if let Some(v) = stry!(match_rp_expr(
+                    stry!(match_rp_expr(
                         outer, opts_w, env, event, state, meta, local, &target, &rp,
-                    )) {
+                    ))
+                    .map_or(Ok(false), |v| {
                         // we need to assign prior to the guard so we can check
                         // against the pattern expressions
                         stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
 
                         test_guard(outer, opts, env, event, state, meta, local, guard)
-                    } else {
-                        Ok(false)
-                    }
+                    })
                 }
                 Pattern::Expr(ref expr) => {
                     let v = stry!(expr.run(opts, env, event, state, meta, local));
@@ -1091,16 +1089,15 @@ where
                     }
                 }
                 Pattern::Tuple(ref tp) => {
-                    if let Some(v) = stry!(match_tp_expr(
+                    stry!(match_tp_expr(
                         outer, opts_w, env, event, state, meta, local, &target, &tp,
-                    )) {
+                    ))
+                    .map_or(Ok(false), |v| {
                         // we need to assign prior to the guard so we can cehck
                         // against the pattern expressions
                         stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
                         test_guard(outer, opts, env, event, state, meta, local, guard)
-                    } else {
-                        Ok(false)
-                    }
+                    })
                 }
                 Pattern::Assign(_) => {
                     error_oops(outer, 0xdead_0004, "nested assign pattern", &env.meta)

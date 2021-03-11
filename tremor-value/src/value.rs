@@ -104,14 +104,20 @@ impl PartialOrd for Static {
     }
 }
 impl Ord for Static {
+    // We allow this since we check bounds before we cast
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::clippy::cast_sign_loss
+    )]
     fn cmp(&self, other: &Self) -> Ordering {
         match (self.0, other.0) {
             (StaticNode::Null, StaticNode::Null) => Ordering::Equal,
             (StaticNode::Null, _) => Ordering::Greater,
             (_, StaticNode::Null) => Ordering::Less,
             (StaticNode::Bool(v1), StaticNode::Bool(v2)) => v1.cmp(&v2),
-            (StaticNode::Bool(_), _) => Ordering::Greater,
-            (_, StaticNode::Bool(_)) => Ordering::Less,
+            (StaticNode::Bool(_b), _) => Ordering::Greater,
+            (_, StaticNode::Bool(_b)) => Ordering::Less,
             (StaticNode::U64(v1), StaticNode::U64(v2)) => v1.cmp(&v2),
             (StaticNode::U64(v1), StaticNode::I64(v2)) => {
                 if let Ok(v2) = v2.try_into() {
@@ -188,43 +194,43 @@ impl<'value> Ord for Value<'value> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Value::Static(v1), Value::Static(v2)) => Static(*v1).cmp(&Static(*v2)),
-            (Value::Static(_), _) => Ordering::Greater,
-            (_, Value::Static(_)) => Ordering::Less,
+            (Value::Static(_s), _) => Ordering::Greater,
+            (_, Value::Static(_s)) => Ordering::Less,
             (Value::Bytes(v1), Value::Bytes(v2)) => v1.cmp(v2),
             (Value::Bytes(v1), Value::String(v2)) => {
                 let v1: &[u8] = &v1;
                 v1.cmp(v2.as_bytes())
             }
             (Value::String(v1), Value::Bytes(v2)) => v1.as_bytes().cmp(&v2),
-            (Value::Bytes(_), _) => Ordering::Greater,
-            (_, Value::Bytes(_)) => Ordering::Less,
+            (Value::Bytes(_b), _) => Ordering::Greater,
+            (_, Value::Bytes(_b)) => Ordering::Less,
             (Value::String(v1), Value::String(v2)) => v1.cmp(v2),
-            (Value::String(_), _) => Ordering::Greater,
-            (_, Value::String(_)) => Ordering::Less,
+            (Value::String(_s), _) => Ordering::Greater,
+            (_, Value::String(_s)) => Ordering::Less,
             (Value::Array(v1), Value::Array(v2)) => v1.cmp(v2),
-            (Value::Array(_), _) => Ordering::Greater,
-            (_, Value::Array(_)) => Ordering::Less,
+            (Value::Array(_a), _) => Ordering::Greater,
+            (_, Value::Array(_a)) => Ordering::Less,
             (Value::Object(v1), Value::Object(v2)) => cmp_map(v1.as_ref(), v2.as_ref()),
         }
     }
 }
 fn cmp_map(left: &Object, right: &Object) -> Ordering {
     // Compare length first
-    if left.len() > right.len() {
-        return Ordering::Greater;
-    } else if left.len() < right.len() {
-        return Ordering::Less;
+
+    match left.len().cmp(&right.len()) {
+        Ordering::Equal => (),
+        o @ Ordering::Greater | o @ Ordering::Less => return o,
     };
+
     // compare keyspace (sorted keys cmp)
     let mut keys_left: Vec<_> = left.keys().collect();
     let mut keys_right: Vec<_> = left.keys().collect();
     keys_left.sort();
     keys_right.sort();
 
-    if keys_left > keys_right {
-        return Ordering::Greater;
-    } else if keys_left < keys_right {
-        return Ordering::Less;
+    match keys_left.cmp(&keys_right) {
+        Ordering::Equal => (),
+        o @ Ordering::Greater | o @ Ordering::Less => return o,
     };
     // Compare values (the first sorted value being non equal determines order)
     for k in keys_left {

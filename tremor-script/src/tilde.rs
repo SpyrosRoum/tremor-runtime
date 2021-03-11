@@ -259,22 +259,17 @@ impl fmt::Display for ExtractorError {
 impl Extractor {
     pub fn cost(&self) -> u64 {
         match self {
+            Extractor::Base64 | Extractor::Grok { .. } => 50,
             Extractor::Glob { .. } => 100,
-            Extractor::Re { .. } => 1000,
-            Extractor::Rerg { .. } => 1000,
-            Extractor::Base64 => 50,
-            Extractor::Kv(_) => 500,
-            Extractor::Json => 500,
-            Extractor::Dissect { .. } => 500,
-            Extractor::Grok { .. } => 50,
-            Extractor::Cidr { .. } => 200,
+            Extractor::Cidr { .. } | Extractor::Datetime { .. } => 200,
+            Extractor::Kv(_) | Extractor::Json | Extractor::Dissect { .. } => 500,
             Extractor::Influx => 750,
-            Extractor::Datetime { .. } => 200,
+            Extractor::Re { .. } | Extractor::Rerg { .. } => 1000,
         }
     }
     /// This is affected only if we use == compairisons
     pub fn is_exclusive_to(&self, value: &Value) -> bool {
-        if let Some(s) = value.as_str() {
+        value.as_str().map_or(true, |s| {
             match self {
                 // If the glob pattern does not match the string we compare to,
                 // we know that the two are exclusive
@@ -311,9 +306,7 @@ impl Extractor {
                     has_timezone,
                 } => datetime::_parse(s, format, *has_timezone).is_err(),
             }
-        } else {
-            true
-        }
+        })
     }
     pub fn new(id: &str, rule_text: &str) -> Result<Self, ExtractorError> {
         let id = id.to_lowercase();

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod analyzer;
 /// Base definition for expressions
 pub mod base_expr;
 pub(crate) mod binary;
@@ -33,6 +34,7 @@ use crate::registry::{
 use crate::script::Return;
 use crate::KnownKey;
 use crate::{stry, tilde::Extractor, EventContext, Value, NO_AGGRS, NO_CONSTS};
+pub(crate) use analyzer::*;
 pub use base_expr::BaseExpr;
 use beef::Cow;
 use halfbrown::HashMap;
@@ -1156,12 +1158,6 @@ pub struct TestExpr {
     pub extractor: Extractor,
 }
 
-impl TestExpr {
-    fn cost(&self) -> u64 {
-        self.extractor.cost()
-    }
-}
-
 /// default case for a match expression
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum DefaultCase<'script> {
@@ -1174,7 +1170,7 @@ pub enum DefaultCase<'script> {
         /// Expressions in the clause
         exprs: Vec<Expr<'script>>,
         /// last expression in the clause
-        last_expr: Expr<'script>,
+        last_expr: Box<Expr<'script>>,
     },
     /// One Expression
     One(Expr<'script>),
@@ -1311,16 +1307,16 @@ impl<'script> ClauseGroup<'script> {
 
     pub(crate) fn precondition(&self) -> Option<&ClausePreCondition<'script>> {
         match self {
-            ClauseGroup::Simple { precondition, .. } => precondition.as_ref(),
-            ClauseGroup::SearchTree { precondition, .. } => precondition.as_ref(),
-            ClauseGroup::Combined { precondition, .. } => precondition.as_ref(),
+            ClauseGroup::Simple { precondition, .. }
+            | ClauseGroup::SearchTree { precondition, .. }
+            | ClauseGroup::Combined { precondition, .. } => precondition.as_ref(),
         }
     }
     pub(crate) fn precondition_mut(&mut self) -> &mut Option<ClausePreCondition<'script>> {
         match self {
-            ClauseGroup::Simple { precondition, .. } => precondition,
-            ClauseGroup::SearchTree { precondition, .. } => precondition,
-            ClauseGroup::Combined { precondition, .. } => precondition,
+            ClauseGroup::Simple { precondition, .. }
+            | ClauseGroup::SearchTree { precondition, .. }
+            | ClauseGroup::Combined { precondition, .. } => precondition,
         }
     }
 
@@ -1354,6 +1350,9 @@ impl<'script> ClauseGroup<'script> {
             }
         }
     }
+
+    // allow this otherwise clippy complains after telling us to use matches
+    #[allow(clippy::blocks_in_if_conditions, clippy::too_many_lines)]
     fn optimize(&mut self) {
         if let Self::Simple {
             patterns,
@@ -1380,6 +1379,8 @@ impl<'script> ClauseGroup<'script> {
                                 }
                                 | PredicatePattern::TildeEq { key, .. } => {
                                     // and the key of this equal is the same in all patterns
+                                    // we allow this because of the borrow checker
+                                    #[allow(clippy::option_if_let_else)]
                                     if let Some(first) = &first_key {
                                         first == key
                                     } else {
@@ -1446,16 +1447,14 @@ impl<'script> ClauseGroup<'script> {
             } else if patterns
                 .iter()
                 .filter(|p| {
-                    if let PredicateClause {
-                        pattern: Pattern::Expr(ImutExprInt::Literal(_)),
-                        guard: None,
-                        ..
-                    } = p
-                    {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(
+                        p,
+                        PredicateClause {
+                            pattern: Pattern::Expr(ImutExprInt::Literal(_)),
+                            guard: None,
+                            ..
+                        }
+                    )
                 })
                 .count()
                 > 2
@@ -1516,10 +1515,6 @@ impl<'script> PredicateClause<'script> {
         } else {
             self.pattern.is_exclusive_to(&other.pattern)
         }
-    }
-    fn cost(&self) -> u64 {
-        let g = if self.guard.is_some() { 10 } else { 0 };
-        g + self.pattern.cost()
     }
 }
 
@@ -1721,18 +1716,6 @@ impl<'script> Pattern<'script> {
     fn is_assign(&self) -> bool {
         matches!(self, Pattern::Assign(_))
     }
-    fn cost(&self) -> u64 {
-        match self {
-            Pattern::Expr(_) => 10,
-            Pattern::Record(r) => r.cost(),
-            Pattern::Array(a) => a.cost(),
-            Pattern::Assign(a) => a.cost(),
-            Pattern::Tuple(t) => t.cost(),
-            Pattern::Extract(e) => e.cost(),
-            Pattern::DoNotCare => 0,
-            Pattern::Default => 0,
-        }
-    }
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
             // Two literals that are different are distinct
@@ -1747,7 +1730,6 @@ impl<'script> Pattern<'script> {
             (Pattern::Assign(AssignPattern { pattern, .. }), p2) => pattern.is_exclusive_to(p2),
             (p1, Pattern::Assign(AssignPattern { pattern, .. })) => p1.is_exclusive_to(pattern),
             // else we're just not accepting equality
-            (Pattern::Array(_), Pattern::Array(_)) => false,
             (
                 Pattern::Tuple(TuplePattern { exprs: exprs1, .. }),
                 Pattern::Tuple(TuplePattern { exprs: exprs2, .. }),
@@ -1755,8 +1737,6 @@ impl<'script> Pattern<'script> {
                 .iter()
                 .zip(exprs2.iter())
                 .any(|(e1, e2)| e1.is_exclusive_to(e2) || e2.is_exclusive_to(e1)),
-            (Pattern::DoNotCare, Pattern::DoNotCare) => false,
-            (Pattern::Default, Pattern::Default) => false,
             _ => false,
         }
     }
@@ -1828,20 +1808,6 @@ pub enum PredicatePattern<'script> {
 }
 
 impl<'script> PredicatePattern<'script> {
-    fn cost(&self) -> u64 {
-        match self {
-            PredicatePattern::TildeEq { test, .. } => test.cost(),
-            PredicatePattern::Bin {
-                rhs: ImutExprInt::Literal(_),
-                ..
-            } => 20,
-            PredicatePattern::Bin { .. } => 100,
-            PredicatePattern::RecordPatternEq { pattern, .. } => pattern.cost(),
-            PredicatePattern::ArrayPatternEq { pattern, .. } => pattern.cost(),
-            PredicatePattern::FieldPresent { .. } => 10,
-            PredicatePattern::FieldAbsent { .. } => 10,
-        }
-    }
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1950,10 +1916,6 @@ pub struct RecordPattern<'script> {
 }
 
 impl<'script> RecordPattern<'script> {
-    fn cost(&self) -> u64 {
-        self.fields.iter().map(|f| f.cost() + 100).sum()
-    }
-
     fn is_exclusive_to(&self, other: &Self) -> bool {
         if self.fields.len() == 1 && other.fields.len() == 1 {
             self.fields
@@ -1982,16 +1944,6 @@ pub enum ArrayPredicatePattern<'script> {
 }
 
 impl<'script> ArrayPredicatePattern<'script> {
-    fn cost(&self) -> u64 {
-        match self {
-            ArrayPredicatePattern::Expr(ImutExprInt::Literal(_)) => 10,
-            ArrayPredicatePattern::Expr(_) => 10,
-            ArrayPredicatePattern::Tilde(t) => t.cost(),
-            ArrayPredicatePattern::Record(r) => r.cost(),
-            ArrayPredicatePattern::Ignore => 1,
-        }
-    }
-
     fn is_exclusive_to(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayPredicatePattern::Record(r1), ArrayPredicatePattern::Record(r2)) => {
@@ -2010,14 +1962,6 @@ pub struct ArrayPattern<'script> {
     /// Predicates
     pub exprs: ArrayPredicatePatterns<'script>,
 }
-
-impl<'script> ArrayPattern<'script> {
-    fn cost(&self) -> u64 {
-        let s: u64 = self.exprs.iter().map(|f| f.cost()).sum();
-
-        s * (self.exprs.len() as u64)
-    }
-}
 impl_expr_mid!(ArrayPattern);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2031,12 +1975,6 @@ pub struct AssignPattern<'script> {
     pub pattern: Box<Pattern<'script>>,
 }
 
-impl<'script> AssignPattern<'script> {
-    fn cost(&self) -> u64 {
-        self.pattern.cost()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize)]
 /// Encapsulates a positional tuple pattern
 pub struct TuplePattern<'script> {
@@ -2046,12 +1984,6 @@ pub struct TuplePattern<'script> {
     pub exprs: ArrayPredicatePatterns<'script>,
     /// True, if the pattern supports variable arguments
     pub open: bool,
-}
-
-impl<'script> TuplePattern<'script> {
-    fn cost(&self) -> u64 {
-        self.exprs.iter().map(|f| f.cost()).sum()
-    }
 }
 impl_expr_mid!(TuplePattern);
 

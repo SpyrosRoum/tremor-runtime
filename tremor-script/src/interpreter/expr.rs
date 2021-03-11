@@ -91,6 +91,7 @@ where
     }
 
     #[inline]
+    #[allow(clippy::clippy::too_many_lines)] // FIXME?
     fn match_expr(
         &'script self,
         opts: ExecOpts,
@@ -126,11 +127,7 @@ where
             } else {
                 None
             };
-            let target: &Value = if let Some(target) = maybe_target.as_ref() {
-                target
-            } else {
-                &target
-            };
+            let target: &Value = maybe_target.as_ref().map_or(&target, |target| target);
             match cg {
                 ClauseGroup::Simple { patterns, .. } => {
                     for predicate in patterns {

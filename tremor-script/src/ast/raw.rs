@@ -19,7 +19,7 @@
 use super::{
     base_expr, path_eq, query, replace_last_shadow_use, ArrayPattern, ArrayPredicatePattern,
     AssignPattern, BinExpr, BinOpKind, Bytes, ClauseGroup, Comprehension, ComprehensionCase,
-    DefaultCase, EmitExpr, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, IfElse,
+    Costly, DefaultCase, EmitExpr, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident, IfElse,
     ImutClauseGroup, ImutComprehension, ImutComprehensionCase, ImutExpr, ImutExprInt, ImutMatch,
     ImutPredicateClause, Invocable, Invoke, InvokeAggr, InvokeAggrFn, List, Literal, LocalPath,
     Match, Merge, MetadataPath, ModDoc, NodeMetas, Patch, PatchOperation, Path, Pattern,
@@ -557,6 +557,7 @@ pub enum ExprRaw<'script> {
 
 impl<'script> Upable<'script> for ExprRaw<'script> {
     type Target = Expr<'script>;
+    #[allow(clippy::clippy::too_many_lines)]
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
         Ok(match self {
             ExprRaw::Module(ModuleRaw { start, end, .. }) => {
@@ -2339,6 +2340,7 @@ fn sort_clauses(patterns: &mut [PredicateClause]) {
 
 impl<'script> Upable<'script> for MatchRaw<'script> {
     type Target = Match<'script>;
+    #[allow(clippy::too_many_lines)]
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
         let mut patterns: Vec<PredicateClause> = self
             .patterns
@@ -2379,17 +2381,17 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
             let mut last = Expr::Drop { mid: 0 };
             std::mem::swap(exprs, &mut es);
             std::mem::swap(last_expr, &mut last);
-            if !exprs.is_empty() {
-                DefaultCase::Many {
-                    exprs: es,
-                    last_expr: last,
-                }
-            } else {
+            if exprs.is_empty() {
                 match last {
                     Expr::Imut(ImutExprInt::Literal(Literal { value, .. })) if value.is_null() => {
                         DefaultCase::Null
                     }
                     last => DefaultCase::One(last),
+                }
+            } else {
+                DefaultCase::Many {
+                    exprs: es,
+                    last_expr: Box::new(last),
                 }
             }
         } else {
@@ -2418,32 +2420,28 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
         }
         sort_clauses(&mut patterns);
         let mut groups = Vec::new();
-        let mut group = Vec::new();
+        let mut group: Vec<PredicateClause> = Vec::new();
 
         for p in patterns {
-            if group.is_empty() {
+            if group
+                .iter()
+                .all(|g| p.is_exclusive_to(g) || g.is_exclusive_to(&p))
+            {
                 group.push(p);
             } else {
-                if group
-                    .iter()
-                    .all(|g| p.is_exclusive_to(g) || g.is_exclusive_to(&p))
-                {
-                    group.push(p);
-                } else {
-                    group.sort_by_key(|c| c.cost());
+                group.sort_by_key(Costly::cost);
 
-                    let mut g = ClauseGroup::Simple {
-                        patterns: group,
-                        precondition: None,
-                    };
-                    g.optimize();
-                    groups.push(g);
-                    group = Vec::new();
-                    group.push(p);
-                }
+                let mut g = ClauseGroup::Simple {
+                    patterns: group,
+                    precondition: None,
+                };
+                g.optimize();
+                groups.push(g);
+                group = Vec::new();
+                group.push(p);
             }
         }
-        group.sort_by_key(|c| c.cost());
+        group.sort_by_key(Costly::cost);
         let mut g = ClauseGroup::Simple {
             patterns: group,
             precondition: None,
@@ -2455,6 +2453,7 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
 
         let pre_combine = groups.len();
         for g in groups {
+            #[allow(clippy::option_if_let_else)]
             if let Some(last) = patterns.last_mut() {
                 if last.combinable(&g) {
                     last.combine(g);
@@ -2462,7 +2461,7 @@ impl<'script> Upable<'script> for MatchRaw<'script> {
                     patterns.push(g);
                 }
             } else {
-                patterns.push(g)
+                patterns.push(g);
             }
         }
         println!("combined: {} -> {}", pre_combine, patterns.len());
